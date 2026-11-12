@@ -1,6 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Ambientes e IDEs
+.env
+.env.*
+!.env.example
+.venv/
+.venv-build/
+venv/
+env/
+.idea/
+.vscode/
+
+# Empacotamento
 build/
 dist/
-*.spec
-__pycache__/
+*.exe
+*.zip
+*.log
+
+# Dados locais e credenciais
 dataset/
-*.json
+config_biometria.json
+client_secrets.json
+credentials.json
+token.json
+settings.yaml
+*.pem
+*.key

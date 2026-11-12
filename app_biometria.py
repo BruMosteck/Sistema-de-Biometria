@@ -1,7 +1,5 @@
 import sys
 import os
-import types
-import importlib.util
 import shutil 
 import json
 import tkinter as tk
@@ -11,14 +9,11 @@ import threading
 import time
 
 # =====================================================================
-# 0. MONKEY PATCH (Correção obrigatória para Python 3.14+)
+# 0. CAMINHOS DO APLICATIVO
 # =====================================================================
-mock_pkg = types.ModuleType("pkg_resources")
-def mock_resource_filename(pkg_name, resource_name):
-    spec = importlib.util.find_spec(pkg_name)
-    return os.path.join(os.path.dirname(spec.origin), resource_name)
-mock_pkg.resource_filename = mock_resource_filename
-sys.modules['pkg_resources'] = mock_pkg 
+BASE_DIR = os.path.dirname(os.path.abspath(
+    sys.executable if getattr(sys, "frozen", False) else __file__
+))
 
 # =====================================================================
 # 1. IMPORTAÇÕES DA VISÃO COMPUTACIONAL
@@ -99,7 +94,7 @@ class BiometriaApp:
         self.modo_simetria = "usuario" 
         self.caminho_upload_atual = ""
         
-        self.arquivo_config = "config_biometria.json"
+        self.arquivo_config = os.path.join(BASE_DIR, "config_biometria.json")
         self.caminho_dataset = self.carregar_configuracao()
         if not os.path.exists(self.caminho_dataset):
             os.makedirs(self.caminho_dataset)
@@ -130,9 +125,10 @@ class BiometriaApp:
         if os.path.exists(self.arquivo_config):
             try:
                 with open(self.arquivo_config, "r", encoding="utf-8") as f:
-                    return json.load(f).get("pasta_armazenamento", "dataset")
-            except: return "dataset"
-        return "dataset"
+                    caminho = json.load(f).get("pasta_armazenamento", "dataset")
+                    return os.path.abspath(os.path.join(BASE_DIR, caminho))
+            except (OSError, ValueError, TypeError): pass
+        return os.path.join(BASE_DIR, "dataset")
 
     def salvar_configuracao(self, novo_caminho):
         with open(self.arquivo_config, "w", encoding="utf-8") as f:
