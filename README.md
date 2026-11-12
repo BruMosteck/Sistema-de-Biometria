@@ -47,6 +47,46 @@ Referências técnicas · [Exemplo de reconhecimento do dlib](https://dlib.net/f
 | [`requirements.txt`](requirements.txt) | Dependências do aplicativo desktop no Windows x64. |
 | [`Biometria ESEG.spec`](Biometria%20ESEG.spec) e [`hooks/`](hooks/) | Configuração do PyInstaller e inclusão dos modelos do dlib no pacote. |
 
+## 📸 Telas do aplicativo
+
+Capturas da versão Windows v1.0.0 em uma instalação com a base de cadastros vazia.
+
+### Menu principal
+
+![Menu inicial com cinco atalhos do Sistema de Biometria](docs/imagens/01-menu-principal.jpg)
+
+O menu reúne os atalhos para cadastrar pessoas, verificar acesso, analisar simetria facial, gerenciar usuários e configurar o armazenamento.
+
+### Cadastro de usuário
+
+![Janela de identificação com o campo de nome em branco](docs/imagens/05-identificacao-para-cadastro.jpg)
+
+Ao escolher **Inscrever Novo Usuário**, o sistema solicita o nome que identificará o cadastro. A confirmação abre a etapa de captura de três fotos pela webcam.
+
+### Verificação de acesso com a base vazia
+
+![Aviso pedindo que seja feito um cadastro antes da verificação](docs/imagens/06-verificacao-base-vazia.jpg)
+
+Ao escolher **Verificar Acesso**, o aplicativo procura amostras de referência. Com a base vazia, ele solicita um cadastro antes de iniciar a câmera.
+
+### Gerenciamento de identidades
+
+![Tela de gerenciamento informando que não há usuários cadastrados](docs/imagens/02-gerenciamento-de-usuarios.jpg)
+
+A lista exibe as identidades da base local e permite remover cadastros existentes. Em uma instalação nova, a área da lista informa que ainda não há usuários.
+
+### Análise de simetria facial
+
+![Tela de simetria com opções para cadastrar um usuário ou escolher uma foto avulsa](docs/imagens/03-analise-de-simetria.jpg)
+
+A tela permite selecionar um rosto já cadastrado ou iniciar a análise com uma foto avulsa. Com a base vazia, o botão **Cadastrar um Usuário** leva ao fluxo de cadastro.
+
+### Foto avulsa
+
+![Área de seleção de arquivo para a análise de uma foto avulsa](docs/imagens/04-foto-avulsa.jpg)
+
+A área de seleção abre um arquivo local em JPG, JPEG, PNG, WEBP ou BMP para análise de simetria. A foto escolhida é carregada para essa análise e fica fora da base de cadastros.
+
 ## 🚀 Como executar
 
 ### Pacote para Windows
