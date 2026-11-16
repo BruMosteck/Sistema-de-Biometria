@@ -1,5 +1,10 @@
 # Sistema de Biometria e Reconhecimento Facial
 
+O código da versão original está em [`semAPI/`](semAPI/).
+A versão com API local, InsightFace e MediaPipe está em [`comAPI/`](comAPI/README.md),
+com cadastro, reconhecimento facial, malha de polígonos e análise de simetria.
+O ponto de entrada é `comAPI/app_biometria.py`, que também inicia a API local.
+
 ![Python 3.12](https://img.shields.io/badge/Python-3.12-3776AB?style=flat-square&logo=python&logoColor=white)
 ![Windows x64](https://img.shields.io/badge/Plataforma-Windows%20x64-0078D4?style=flat-square)
 ![Status acadêmico](https://img.shields.io/badge/Status-Projeto%20acad%C3%AAmico-2E7D32?style=flat-square)
