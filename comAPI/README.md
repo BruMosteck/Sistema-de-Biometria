@@ -38,7 +38,10 @@ Depois de baixar os modelos, não é preciso enviar imagens para serviços exter
   As instruções de ângulo são orientativas; o cadastro valida um único rosto e tamanho mínimo.
   O conjunto é salvo somente depois que as três fotos passam na validação.
 - Reconhecimento ao vivo com InsightFace e malha de polígonos do MediaPipe.
-  A foto salva não contém os desenhos. Quando a malha não é detectada,
+  Os polígonos aparecem na inscrição e no reconhecimento. O nome fica acima
+  do rosto correspondente e acompanha sua posição, inclusive com várias pessoas.
+  A foto salva não contém nomes nem desenhos; as telas de simetria mostram
+  imagens limpas, inclusive na análise numérica. Quando a malha não é detectada,
   isso não impede o InsightFace de tentar reconhecer o rosto.
 - Comparação com cada amostra individual: cosseno mínimo de 0,50 e diferença
   mínima de 0,05 para a segunda identidade. São parâmetros iniciais para avaliação,
@@ -46,9 +49,12 @@ Depois de baixar os modelos, não é preciso enviar imagens para serviços exter
 - Listagem e exclusão dos usuários e suas fotos.
 - Seleção da pasta local dos cadastros. Trocar a pasta não move nem apaga a base anterior.
   É possível selecionar o `dataset` da versão antiga; vetores são recalculados com InsightFace.
-- Simetria de foto cadastrada ou avulsa, sem cadastrar a foto avulsa.
+- Menu **Alterações faciais**, com o tópico **Simetria**: escolha entre analisar
+  a simetria ou gerar um retrato espelhando a metade direita ou esquerda da pessoa.
+  Use uma foto cadastrada ou avulsa, sem cadastrar a foto avulsa.
   Exige um rosto frontal, sem obstruções e com expressão neutra; a pose é verificada
-  pelo modelo. Não há simulação por espelhamento nesta etapa.
+  pelo modelo. O resultado mostra original alinhada e imagem simétrica lado a lado.
+  É possível trocar o lado sem selecionar a foto novamente e salvar o resultado em PNG.
 
 Fotos ficam em `dataset/<nome>/foto_1.jpg`, `foto_2.jpg`, `foto_3.jpg`, dentro de
 `comAPI/` por padrão. A pasta escolhida é registrada em `config_biometria.json`.
@@ -67,6 +73,23 @@ A pontuação é `máximo(0, 100 × (1 − média dos erros normalizados))`.
 medida universal de beleza. Pose, expressão, perspectiva, iluminação e erros de
 localização dos pontos alteram o resultado. As pontuações diferem da fórmula da versão antiga.
 
+## Gerar simetria pelo lado escolhido
+
+A linha dos olhos orienta o alinhamento; testa e queixo definem o eixo central.
+O contorno facial determina um recorte com margem. As duas imagens da comparação
+recebem exatamente esse mesmo alinhamento e enquadramento. A largura do recorte
+é ímpar, com uma coluna central e duas metades de tamanho igual.
+
+- **Lado direito da pessoa:** preserva a metade à esquerda da foto e a espelha sobre a outra.
+- **Lado esquerdo da pessoa:** preserva a metade à direita da foto e a espelha sobre a outra.
+
+Essa convenção considera uma foto não espelhada, como as capturas da aplicação.
+As legendas indicam os lados da foto para permitir a escolha em imagens avulsas.
+O espelhamento inclui o entorno do rosto no recorte (como cabelo e fundo).
+Margens que ultrapassem a fotografia usam os pixels de borda. É uma simulação
+por reflexão de pixels; não cria novos traços nem altera os arquivos de cadastro.
+As imagens geradas só são gravadas quando o usuário escolhe **Salvar imagem**.
+
 ## API local
 
 O aplicativo escolhe uma porta livre em `127.0.0.1` e imprime o endereço no terminal.
@@ -83,6 +106,7 @@ compartilhado internamente entre a interface e a API. Não há servidor público
 | GET | `/usuarios/{nome}/foto` | Obter a primeira foto para simetria |
 | PUT | `/armazenamento` | Selecionar a pasta por JSON `pasta_armazenamento` |
 | POST | `/simetria` | Analisar foto multipart `arquivo` |
+| POST | `/simetria/gerar?lado=direita` ou `esquerda` | Gerar retrato simétrico a partir de multipart `arquivo`; retorna os PNGs em base64 |
 
 Uploads aceitam JPEG, PNG, WEBP ou BMP de até 8 MiB e 20 milhões de pixels;
 orientação EXIF é corrigida e o maior lado é reduzido para até 960 pixels.

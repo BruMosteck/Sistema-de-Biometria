@@ -1,6 +1,7 @@
 """API local e motor facial. Iniciada automaticamente por app_biometria.py."""
 
 from io import BytesIO
+import base64
 import json
 import logging
 import os
@@ -9,6 +10,7 @@ import re
 import shutil
 import threading
 from types import SimpleNamespace
+from typing import Literal
 import uuid
 import warnings
 
@@ -30,6 +32,9 @@ PARES = {
     "Boca": [(61, 291), (78, 308), (82, 312)],
     "Mandíbula": [(234, 454), (93, 323), (172, 397)],
 }
+OVAL_FACIAL = [10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288,
+              397, 365, 379, 378, 400, 377, 152, 148, 176, 149, 150, 136,
+              172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109]
 
 
 def nome_seguro(nome):
@@ -117,6 +122,57 @@ def calcular_simetria(pontos):
             "regioes": regioes,
             "eixo": [pontos[10].tolist(), pontos[152].tolist()],
             "nota": "Estimativa geométrica da foto, sensível a pose e expressão; não é uma avaliação clínica."}
+
+
+def gerar_rosto_simetrico(imagem, pontos, lado):
+    """Alinha um retrato e espelha a metade escolhida sem gerar novos traços."""
+    if lado not in {"direita", "esquerda"}:
+        raise HTTPException(422, "Escolha o lado direito ou esquerdo do rosto.")
+    pontos = np.asarray(pontos, dtype=np.float64)
+    if (pontos.ndim != 2 or pontos.shape[0] < 455 or pontos.shape[1] != 2
+            or not np.isfinite(pontos).all()):
+        raise HTTPException(422, "Pontos faciais insuficientes para gerar a imagem.")
+    olho_direito = pontos[[33, 133]].mean(axis=0)
+    olho_esquerdo = pontos[[263, 362]].mean(axis=0)
+    horizontal = olho_esquerdo - olho_direito
+    distancia = np.linalg.norm(horizontal)
+    if distancia < 10:
+        raise HTTPException(422, "O rosto está pequeno demais para gerar a simetria.")
+    horizontal /= distancia
+    vertical = np.array([-horizontal[1], horizontal[0]])
+    centro = (pontos[10] + pontos[152]) / 2
+    oval = (pontos[OVAL_FACIAL] - centro) @ np.stack([horizontal, vertical], axis=1)
+    altura_rosto = float(np.ptp(oval[:, 1]))
+    meia_largura = int(np.ceil(np.max(np.abs(oval[:, 0])) * 1.25))
+    topo = int(np.floor(oval[:, 1].min() - altura_rosto * 0.25))
+    fundo = int(np.ceil(oval[:, 1].max() + altura_rosto * 0.12))
+    if altura_rosto < 20 or meia_largura < 10:
+        raise HTTPException(422, "Não foi possível obter o contorno do rosto.")
+    # Limita a área gerada mesmo se uma medição do modelo vier distorcida.
+    h, w = imagem.shape[:2]
+    if meia_largura * 2 + 1 > w * 3 or fundo - topo + 1 > h * 3:
+        raise HTTPException(422, "Contorno facial inválido. Tente outra foto frontal.")
+    matriz = np.array([
+        [*horizontal, meia_largura - float(horizontal @ centro)],
+        [*vertical, -topo - float(vertical @ centro)],
+    ], dtype=np.float64)
+    original = cv2.warpAffine(imagem, matriz, (2 * meia_largura + 1, fundo - topo + 1),
+                              flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    simetrica = original.copy()
+    # Foto não espelhada: o lado direito da pessoa aparece à esquerda da foto.
+    # Largura ímpar mantém uma coluna central única e dois lados de mesmo tamanho.
+    if lado == "direita":
+        simetrica[:, meia_largura + 1:] = original[:, :meia_largura][:, ::-1]
+    else:
+        simetrica[:, :meia_largura] = original[:, meia_largura + 1:][:, ::-1]
+    return original, simetrica
+
+
+def png_base64(imagem):
+    sucesso, dados = cv2.imencode(".png", imagem)
+    if not sucesso:
+        raise RuntimeError("Não foi possível codificar a imagem gerada.")
+    return base64.b64encode(dados).decode("ascii")
 
 
 class MotorFacial:
@@ -404,6 +460,18 @@ def criar_api(motor=None, token=None):
         with motor.lock:
             motor.preparar()
             return motor.simetria(imagem)
+
+    @app.post("/simetria/gerar")
+    def gerar_simetria(arquivo: UploadFile, lado: Literal["direita", "esquerda"]):
+        imagem = ler_imagem(arquivo)
+        with motor.lock:
+            motor.preparar()
+            analise = motor.simetria(imagem)
+            original, simetrica = gerar_rosto_simetrico(imagem, analise["malhas"][0], lado)
+        return {"lado": lado, "original_png": png_base64(original),
+                "simetrica_png": png_base64(simetrica),
+                "nota": "As duas imagens usam o mesmo alinhamento e recorte. "
+                        "A simulação espelha a metade escolhida, incluindo o entorno do rosto."}
 
     @app.get("/usuarios/{nome}/foto")
     def foto_usuario(nome: str):
