@@ -1,6 +1,7 @@
 """Ponto de entrada: interface Tkinter e inicialização automática da API local."""
 
 from io import BytesIO
+import base64
 import importlib.util
 from pathlib import Path
 from queue import Empty, Full, Queue
@@ -173,6 +174,43 @@ class LeituraVisual:
         return self.faces
 
 
+def pontos_dos_rostos(faces, largura, altura):
+    """Grade de textura de cada caixa, na mesma ordem das identidades da API."""
+    grupos = []
+    for face in faces:
+        x1, y1, x2, y2 = face["caixa"]
+        xs = np.linspace(np.clip(x1, 0, largura - 1), np.clip(x2, 0, largura - 1), 7)
+        ys = np.linspace(np.clip(y1, 0, altura - 1), np.clip(y2, 0, altura - 1), 7)
+        grupos.append(np.stack(np.meshgrid(xs, ys), axis=-1).reshape(-1, 2))
+    return grupos
+
+
+def desenhar_nomes(imagem, faces, posicoes, reconhecer):
+    """Rótulos nas caixas acompanhadas; nunca associa rostos pela ordem das malhas."""
+    if len(posicoes) != len(faces):
+        return imagem
+    altura, largura = imagem.shape[:2]
+    for face, pontos in zip(faces, posicoes):
+        pontos = np.asarray(pontos)
+        x1, y1 = pontos.min(axis=0)
+        x2, _ = pontos.max(axis=0)
+        texto = (face["nome"] or "ACESSO NEGADO") if reconhecer else "Rosto detectado"
+        if not face["qualidade_ok"]:
+            texto = "Aproxime-se da camera"
+        texto = unicodedata.normalize("NFKD", texto).encode("ascii", "ignore").decode()
+        fonte, escala, espessura = cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2
+        (w, h), base = cv2.getTextSize(texto, fonte, escala, espessura)
+        if w > largura - 16:
+            escala *= (largura - 16) / w
+            (w, h), base = cv2.getTextSize(texto, fonte, escala, espessura)
+        x = int(np.clip((x1 + x2 - w) / 2, 8, max(8, largura - w - 8)))
+        y = int(np.clip(y1 - 12, h + 6, max(h + 6, altura - base - 6)))
+        cor = (70, 220, 90) if face["nome"] else (0, 180, 255)
+        cv2.rectangle(imagem, (x - 5, y - h - 5), (x + w + 5, y + base + 4), (24, 24, 24), -1)
+        cv2.putText(imagem, texto, (x, y), fonte, escala, cor, espessura, cv2.LINE_AA)
+    return imagem
+
+
 class Camera:
     """Leitura contínua; a análise sempre pega a captura mais recente."""
 
@@ -237,6 +275,7 @@ class BiometriaApp:
         self.preview_id = None
         self.sequencia_video = -1
         self.malha_em_movimento = MalhaEmMovimento()
+        self.posicoes_faces = MalhaEmMovimento()
         self.leitura_visual = LeituraVisual()
         self.geracao = 0
         self.ocupado = False
@@ -273,7 +312,7 @@ class BiometriaApp:
 
     def bloquear(self, bloqueado, pai=None):
         for widget in (pai or self.root).winfo_children():
-            if isinstance(widget, tk.Button):
+            if isinstance(widget, (tk.Button, tk.Radiobutton)):
                 widget.configure(state="disabled" if bloqueado else "normal")
             self.bloquear(bloqueado, widget)
 
@@ -383,6 +422,7 @@ class BiometriaApp:
             self.camera = None
         self.frame = self.analise = None
         self.malha_em_movimento = MalhaEmMovimento()
+        self.posicoes_faces = MalhaEmMovimento()
         self.leitura_visual = LeituraVisual()
 
     def limpar(self):
@@ -401,7 +441,7 @@ class BiometriaApp:
         for texto, comando, cor in [
             ("Inscrever novo usuário", self.cadastro, "#388E3C"),
             ("Verificar acesso", self.verificacao, "#1976D2"),
-            ("Análise de simetria facial", self.tela_simetria, "#008C9E"),
+            ("Alterações faciais", self.alteracoes_faciais, "#008C9E"),
             ("Gerenciar usuários", self.usuarios, "#7B1FA2"),
             ("Armazenamento", self.armazenamento, "#B36B00"),
         ]:
@@ -499,19 +539,22 @@ class BiometriaApp:
             # O vídeo nunca aguarda HTTP ou inferência. O fluxo óptico serve
             # apenas para acompanhar os polígonos entre leituras do modelo.
             malhas = self.malha_em_movimento.acompanhar(frame, inicio)
-            self.desenhar_malha(frame, malhas)
+            posicoes = self.posicoes_faces.acompanhar(frame, inicio)
+            # Polígonos e nomes existem apenas na cópia usada pela prévia.
+            # O quadro limpo da análise permanece disponível para o cadastro.
+            opacidade = 0.35
+
+            camada = frame.copy()
+            self.desenhar_malha(camada, malhas)
+
+            exibicao = cv2.addWeighted(
+                camada, opacidade,
+                frame, 1 - opacidade,
+                0
+            )
             faces_visiveis = self.leitura_visual.visiveis(inicio)
-            if faces_visiveis:
-                for indice, face in enumerate(faces_visiveis):
-                    texto = (face["nome"] or "ACESSO NEGADO") if self.reconhecer else "Rosto detectado"
-                    if not face["qualidade_ok"]:
-                        texto = "Aproxime-se da camera"
-                    # Identidade é uma leitura recente do modelo; não é propagada
-                    # pelo fluxo óptico para outras posições ou outros rostos.
-                    ascii_texto = unicodedata.normalize("NFKD", texto).encode("ascii", "ignore").decode()
-                    cv2.putText(frame, "Leitura: " + ascii_texto, (12, 26 + 26 * indice), cv2.FONT_HERSHEY_SIMPLEX,
-                                0.65, (70, 220, 90) if face["nome"] else (0, 180, 255), 2)
-            self.mostrar_imagem(self.painel_video, frame, rapido=True)
+            desenhar_nomes(exibicao, faces_visiveis, posicoes, self.reconhecer)
+            self.mostrar_imagem(self.painel_video, exibicao, rapido=True)
         atraso = max(1, round(33 - (time.monotonic() - inicio) * 1000))
         self.preview_id = self.root.after(atraso, self.atualizar_video)
 
@@ -596,14 +639,16 @@ class BiometriaApp:
                         cv2.polylines(imagem, [vertices], True, (210, 210, 0), 1, cv2.LINE_AA)
         return imagem
 
-    def mostrar_imagem(self, painel, frame, tamanho=(850, 440), rapido=False):
+    def mostrar_imagem(self, painel, frame, tamanho=(850, 440), rapido=False, ampliar=False):
         if rapido:
             h, w = frame.shape[:2]
             fator = min(tamanho[0] / w, tamanho[1] / h, 1)
             if fator < 1:
                 frame = cv2.resize(frame, (round(w * fator), round(h * fator)), interpolation=cv2.INTER_AREA)
         imagem = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-        if not rapido:
+        if ampliar:
+            imagem = ImageOps.contain(imagem, tamanho, Image.Resampling.LANCZOS)
+        elif not rapido:
             imagem.thumbnail(tamanho, Image.Resampling.LANCZOS)
         anterior = getattr(painel, "image", None)
         if rapido and anterior is not None and (anterior.width(), anterior.height()) == imagem.size:
@@ -674,26 +719,53 @@ class BiometriaApp:
         self.tarefa(lambda: self.chamar("PUT", "/armazenamento", json={"pasta_armazenamento": pasta}).json(),
                     concluido, "Selecionando pasta e extraindo referências faciais das fotos…")
 
+    def alteracoes_faciais(self):
+        if not self.exigir_pronto():
+            return
+        self.limpar()
+        self.rotulo(self.conteudo, "Alterações faciais", 22).pack(pady=(35, 15))
+        self.rotulo(self.conteudo, "Escolha o que deseja fazer com o rosto.", cor=self.MUTED).pack(pady=10)
+        card = tk.Frame(self.conteudo, bg=self.CARD, padx=30, pady=25)
+        card.pack(expand=True)
+        self.rotulo(card, "Simetria", 18).pack(pady=10)
+        self.rotulo(card, "Analise os dois lados do rosto ou crie um retrato simétrico\n"
+                         "usando a metade direita ou esquerda como referência.", cor=self.MUTED).pack(pady=10)
+        self.botao(card, "Abrir simetria", self.tela_simetria, "#008C9E").pack(fill="x", pady=15)
+        self.botao(self.conteudo, "Voltar ao menu", self.menu, "#424242").pack(pady=20)
+
     def tela_simetria(self):
         if not self.exigir_pronto():
             return
         self.limpar()
-        self.rotulo(self.conteudo, "Análise de simetria facial", 18).pack(pady=15)
+        self.rotulo(self.conteudo, "Alterações faciais / Simetria", 18).pack(pady=12)
         self.rotulo(self.conteudo, "Use uma foto frontal, sem obstruções e com expressão neutra.",
                     cor=self.MUTED).pack(pady=8)
+        self.modo_simetria = tk.StringVar(value="direita")
+        opcoes = tk.Frame(self.conteudo, bg=self.CARD, padx=18, pady=10)
+        opcoes.pack(fill="x", padx=60, pady=6)
+        for texto, valor in [
+            ("Gerar pelo lado direito da pessoa (à esquerda da foto)", "direita"),
+            ("Gerar pelo lado esquerdo da pessoa (à direita da foto)", "esquerda"),
+            ("Apenas analisar a simetria da foto", "analisar"),
+        ]:
+            tk.Radiobutton(opcoes, text=texto, variable=self.modo_simetria, value=valor,
+                           bg=self.CARD, fg="white", selectcolor="#333333", activebackground=self.CARD,
+                           activeforeground="white", font=("Segoe UI", 11)).pack(anchor="w", pady=3)
         self.botao(self.conteudo, "Selecionar foto avulsa", self.foto_avulsa, "#008C9E").pack(pady=10)
         self.lista = tk.Listbox(self.conteudo, bg=self.CARD, fg="white", selectbackground="#008C9E",
-                               font=("Segoe UI", 13), height=8, bd=0)
+                               font=("Segoe UI", 13), height=5, bd=0)
         self.lista.pack(fill="both", expand=True, padx=60, pady=15)
         self.nomes_lista = [u["nome"] for u in self.info["usuarios"]]
         for nome in self.nomes_lista:
             self.lista.insert("end", nome)
-        self.botao(self.conteudo, "Analisar foto frontal do usuário", self.foto_cadastrada, "#008C9E").pack(pady=12)
+        self.botao(self.conteudo, "Usar foto frontal do usuário selecionado", self.foto_cadastrada, "#008C9E").pack(pady=8)
+        self.botao(self.conteudo, "Voltar às alterações faciais", self.alteracoes_faciais, "#424242").pack(pady=8)
 
     def foto_avulsa(self):
         caminho = filedialog.askopenfilename(filetypes=[("Imagens", "*.jpg *.jpeg *.png *.webp *.bmp")])
         if not caminho:
             return
+        modo = self.modo_simetria.get()
 
         def trabalho():
             with Image.open(caminho) as original:
@@ -702,40 +774,52 @@ class BiometriaApp:
                 imagem = ImageOps.exif_transpose(original).convert("RGB")
                 imagem.thumbnail((960, 960))
             frame = cv2.cvtColor(np.array(imagem), cv2.COLOR_RGB2BGR)
-            return self.analisar_simetria(frame)
+            return self.analisar_simetria(frame, modo)
 
-        self.tarefa(trabalho, self.resultado_simetria, "Localizando pontos e comparando os dois lados da foto…")
+        self.tarefa(trabalho, self.resultado_simetria, "Preparando a foto e processando a simetria escolhida…")
 
     def foto_cadastrada(self):
         nome = self.selecionado()
         if not nome:
             return
+        modo = self.modo_simetria.get()
 
         def trabalho():
             resposta = self.chamar("GET", f"/usuarios/{quote(nome, safe='')}/foto")
             frame = cv2.imdecode(np.frombuffer(resposta.content, np.uint8), cv2.IMREAD_COLOR)
             if frame is None:
                 raise ValueError("Foto cadastrada inválida.")
-            return self.analisar_simetria(frame)
+            return self.analisar_simetria(frame, modo)
 
         self.tarefa(trabalho, self.resultado_simetria, "Analisando a foto frontal cadastrada…")
 
-    def analisar_simetria(self, frame):
+    def analisar_simetria(self, frame, modo="analisar"):
+        if modo in {"direita", "esquerda"}:
+            resultado = self.chamar("POST", f"/simetria/gerar?lado={modo}",
+                                    files={"arquivo": ("foto.jpg", jpeg(frame), "image/jpeg")}).json()
+            imagens = []
+            for chave in ("original_png", "simetrica_png"):
+                dados = base64.b64decode(resultado.pop(chave), validate=True)
+                imagem = cv2.imdecode(np.frombuffer(dados, np.uint8), cv2.IMREAD_COLOR)
+                if imagem is None:
+                    raise ValueError("A API não retornou uma imagem válida.")
+                imagens.append(imagem)
+            return imagens[0], {**resultado, "imagem_simetrica": imagens[1], "foto_fonte": frame}
         resultado = self.chamar("POST", "/simetria", files={"arquivo": ("foto.jpg", jpeg(frame), "image/jpeg")}).json()
         return frame, resultado
 
     def resultado_simetria(self, dados):
         frame, resultado = dados
+        if "imagem_simetrica" in resultado:
+            self.comparacao_simetria(frame, resultado)
+            return
         self.limpar()
         self.rotulo(self.conteudo, f"Simetria geométrica estimada: {resultado['pontuacao']:.1f}/100", 20).pack(pady=12)
         colunas = tk.Frame(self.conteudo, bg=self.BG)
         colunas.pack(fill="both", expand=True)
         imagem = tk.Label(colunas, bg=self.CARD)
         imagem.pack(side="left", expand=True, fill="both", padx=10)
-        anotada = self.desenhar_malha(frame.copy(), resultado["malhas"])
-        eixo = np.rint(resultado["eixo"]).astype(int)
-        cv2.line(anotada, tuple(eixo[0]), tuple(eixo[1]), (0, 255, 255), 2, cv2.LINE_AA)
-        self.mostrar_imagem(imagem, anotada, (500, 400))
+        self.mostrar_imagem(imagem, frame, (500, 400))
         detalhes = tk.Frame(colunas, bg=self.BG)
         detalhes.pack(side="right", padx=15)
         for regiao, valores in resultado["regioes"].items():
@@ -747,6 +831,53 @@ class BiometriaApp:
         self.rotulo(self.conteudo, resultado["nota"], 10, "#FFB74D").pack(pady=8)
         self.botao(self.conteudo, "Analisar outra foto", self.tela_simetria, "#008C9E").pack(pady=12)
         self.status.set("Análise concluída. Fotos avulsas não são incluídas nos cadastros.")
+
+    def comparacao_simetria(self, original, resultado):
+        self.limpar()
+        lado = resultado["lado"]
+        lado_texto = "direito" if lado == "direita" else "esquerdo"
+        self.imagem_simetrica = resultado["imagem_simetrica"]
+        self.rotulo(self.conteudo, f"Simetria pelo lado {lado_texto} do rosto", 20).pack(pady=12)
+        self.rotulo(self.conteudo, "Compare o mesmo enquadramento antes e depois do espelhamento.",
+                    cor=self.MUTED).pack(pady=5)
+        comparacao = tk.Frame(self.conteudo, bg=self.BG)
+        comparacao.pack(fill="both", expand=True, pady=12)
+        comparacao.grid_columnconfigure((0, 1), weight=1, uniform="fotos")
+        comparacao.grid_rowconfigure(0, weight=1)
+        for coluna, (titulo, imagem) in enumerate([
+            ("Original alinhada", original), (f"Simétrica · referência: lado {lado_texto}", self.imagem_simetrica)
+        ]):
+            card = tk.Frame(comparacao, bg=self.CARD, padx=8, pady=8)
+            card.grid(row=0, column=coluna, sticky="nsew", padx=6)
+            self.rotulo(card, titulo, 12).pack(pady=8)
+            painel = tk.Label(card, bg=self.CARD)
+            painel.pack(expand=True)
+            self.mostrar_imagem(painel, imagem, (400, max(200, min(370, self.root.winfo_height() - 400))), ampliar=True)
+        self.rotulo(self.conteudo, resultado["nota"], 10, self.MUTED).pack(pady=6)
+        acoes = tk.Frame(self.conteudo, bg=self.BG)
+        acoes.pack(pady=8)
+        fonte = resultado["foto_fonte"]
+        for texto, novo_lado in [("Usar lado direito", "direita"), ("Usar lado esquerdo", "esquerda")]:
+            self.botao(acoes, texto,
+                       lambda l=novo_lado: self.tarefa(
+                           lambda: self.analisar_simetria(fonte, l), self.resultado_simetria,
+                           "Gerando a simetria pelo lado escolhido…"), "#008C9E").pack(side="left", padx=5)
+        self.botao(acoes, "Salvar imagem", self.salvar_simetrica, "#388E3C").pack(side="left", padx=5)
+        self.botao(acoes, "Voltar à simetria", self.tela_simetria, "#424242").pack(side="left", padx=5)
+        self.status.set("Imagem gerada localmente. A foto de cadastro permanece intacta.")
+
+    def salvar_simetrica(self):
+        caminho = filedialog.asksaveasfilename(title="Salvar imagem simétrica", defaultextension=".png",
+                                              filetypes=[("Imagem PNG", "*.png")])
+        if caminho:
+            try:
+                sucesso, dados = cv2.imencode(".png", self.imagem_simetrica)
+                if not sucesso:
+                    raise ValueError("Não foi possível codificar a imagem.")
+                Path(caminho).write_bytes(dados.tobytes())
+                self.status.set("Imagem simétrica salva.")
+            except (OSError, ValueError) as erro:
+                messagebox.showerror("Falha ao salvar", str(erro))
 
     def processar_eventos(self):
         try:
@@ -784,6 +915,7 @@ class BiometriaApp:
                 if erro:
                     self.frame = self.analise = None
                     self.malha_em_movimento = MalhaEmMovimento()
+                    self.posicoes_faces = MalhaEmMovimento()
                     self.leitura_visual = LeituraVisual()
                     self.status.set(erro)
                 else:
@@ -792,6 +924,10 @@ class BiometriaApp:
                     self.leitura_visual.atualizar(analise["faces"], recebido_em)
                     self.malha_em_movimento.atualizar(
                         frame, analise["malhas"], analise["capturado_em"],
+                        recebido_em=recebido_em, validade=self.leitura_visual.validade)
+                    h, w = frame.shape[:2]
+                    self.posicoes_faces.atualizar(
+                        frame, pontos_dos_rostos(analise["faces"], w, h), analise["capturado_em"],
                         recebido_em=recebido_em, validade=self.leitura_visual.validade)
                     nomes = []
                     for face in self.leitura_visual.visiveis(recebido_em):
