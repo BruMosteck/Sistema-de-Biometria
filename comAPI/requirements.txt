@@ -1,0 +1,13 @@
+# Python 3.12 x64. Sem PyTorch e sem o motor da versão semAPI.
+insightface==2.1
+mediapipe==0.10.35
+onnxruntime==1.32.0
+# InsightFace exige python e MediaPipe exige contrib; manter a mesma versão.
+opencv-python==5.0.0.93
+opencv-contrib-python==5.0.0.93
+numpy==2.5.5
+Pillow==13.0.0
+fastapi==0.163.1
+uvicorn==0.54.0
+python-multipart==0.0.34
+requests==2.34.2
