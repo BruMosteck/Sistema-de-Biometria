@@ -7,10 +7,10 @@ a = Analysis(
     pathex=[str(root)],
     binaries=[],
     datas=[],
-    hiddenimports=["pkg_resources"],
-    hookspath=[str(root / "hooks")],
+    hiddenimports=[],
+    hookspath=[],
     runtime_hooks=[],
-    excludes=[],
+    excludes=["dlib", "face_recognition", "face_recognition_models", "insightface", "mediapipe"],
     noarchive=False,
 )
 pyz = PYZ(a.pure)
