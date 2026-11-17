@@ -3,10 +3,12 @@ import os
 import shutil 
 import json
 import tkinter as tk
-from tkinter import simpledialog, messagebox, filedialog
+from tkinter import simpledialog, messagebox, filedialog, ttk
 from PIL import Image, ImageTk, ImageOps # NOVO: ImageOps para corrigir a rotação EXIF
 import threading
 import time
+import queue
+from concurrent.futures import CancelledError
 
 # =====================================================================
 # 0. CAMINHOS DO APLICATIVO
@@ -19,9 +21,13 @@ BASE_DIR = os.path.dirname(os.path.abspath(
 # 1. IMPORTAÇÕES DA VISÃO COMPUTACIONAL
 # =====================================================================
 try:
-    import face_recognition
     import cv2
     import numpy as np
+    from reconhecimento_classico import (
+        EXTENSOES, carregar_referencias, classificar, extrair_descritor, ler_imagem,
+        normalizar_rosto, salvar_olhos,
+        distancia_m2hd, salvar_painel_contornos,
+    )
 except Exception as e:
     import traceback
     root = tk.Tk()
@@ -32,10 +38,57 @@ except Exception as e:
 # =====================================================================
 # 2. ARQUITETURA DO SOFTWARE E DESIGN (UI/UX)
 # =====================================================================
+def calcular_simetria_manual(pontos):
+    """Medida 2D didática por seis marcações, sem detector ou modelo treinado.
+
+    Ordem: olhos à esquerda/direita da foto, ponte do nariz, ponta do queixo,
+    extremidades à esquerda/direita. Os olhos definem o referencial; entram
+    na nota os erros de reflexão do contorno, do nariz e do queixo.
+    """
+    pontos = np.asarray(pontos, dtype=np.float64)
+    if pontos.shape != (6, 2) or not np.isfinite(pontos).all():
+        raise ValueError("Marque os seis pontos pedidos na fotografia.")
+    horizontal = pontos[1] - pontos[0]
+    distancia_olhos = float(np.linalg.norm(horizontal))
+    if not np.isfinite(distancia_olhos) or distancia_olhos < 1e-6 or horizontal[0] <= 0:
+        raise ValueError("Marque os dois olhos separados, da esquerda para a direita da foto.")
+    horizontal /= distancia_olhos
+    vertical = np.array([-horizontal[1], horizontal[0]])
+    origem = (pontos[0] + pontos[1]) / 2
+    alinhados = (pontos - origem) @ np.column_stack((horizontal, vertical))
+    olho_esq, olho_dir, nariz, queixo, extremo_esq, extremo_dir = alinhados
+    largura = float(extremo_dir[0] - extremo_esq[0])
+    if not np.isfinite(alinhados).all() or not np.isfinite(largura):
+        raise ValueError("As coordenadas das marcações são inválidas.")
+    if largura < 1e-6 or not extremo_esq[0] < 0 < extremo_dir[0]:
+        raise ValueError("Marque uma extremidade em cada lado do rosto, seguindo os lados da foto.")
+    if queixo[1] <= max(0., nariz[1]):
+        raise ValueError("A ponta do queixo deve ficar abaixo dos olhos e do nariz no rosto alinhado.")
+    if not extremo_esq[0] <= queixo[0] <= extremo_dir[0]:
+        raise ValueError("A ponta do queixo deve ficar entre as duas extremidades do rosto.")
+    refletir = np.array([-1., 1.])
+    erros = {
+        "contorno": float(np.linalg.norm(extremo_esq * refletir - extremo_dir) / largura),
+        "nariz": float(np.linalg.norm(nariz * refletir - nariz) / largura),
+        "queixo": float(np.linalg.norm(queixo * refletir - queixo) / largura),
+    }
+    return {
+        "pontuacao": float(np.clip(100 * (1 - np.mean(list(erros.values()))), 0, 100)),
+        "largura": largura,
+        "distancias_olhos": (float(-olho_esq[0]), float(olho_dir[0])),
+        "distancias_extremidades": (float(-extremo_esq[0]), float(extremo_dir[0])),
+        "desnivel_extremidades": float(abs(extremo_esq[1] - extremo_dir[1])),
+        "desvio_nariz": float(abs(nariz[0])),
+        "queixo_alinhado": (float(queixo[0]), float(queixo[1])),
+        "erros_normalizados": erros,
+    }
+
+
 class BiometriaApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Sistema Neural de Biometria")
+        self.root.title("Biometria Clássica — Contornos e Hausdorff")
+        self.root.protocol("WM_DELETE_WINDOW", self.fechar)
         
         # 🎨 PALETA DE CORES (Dark Mode Profissional)
         self.bg_main = "#121212"      
@@ -74,21 +127,30 @@ class BiometriaApp:
         self.root.geometry(f"{largura_janela}x{altura_janela}+{pos_x}+{pos_y}")
         
         # Variáveis Globais
-        self.cap = None
         self.loop_id = None
         self.is_camera_running = False
         self.frame_atual_camera = None
+        self.erro_camera = None
+        self.parar_camera = threading.Event()
+        self.thread_camera = None
+        self.sessao_camera = 0
+        self.parar_processamento = threading.Event()
+        self.loop_processamento = None
+        self.thread_processamento = None
         
-        self.vetores, self.nomes = [], []
+        self.referencias, self.nomes = [], []
         self.nome_cadastro = ""
-        self.fotos_tiradas = 0
         self.diretorio_cadastro = ""
         
         self.is_verifying = False
         self.cadastro_iniciado = False
-        self.rosto_alinhado = False
-        self.cache_rostos_cadastro = []
-        self.cache_resultados_ia = [] 
+        self.resultado_comparacao = None
+        self.captura_verificacao = None
+        self.comparando = False
+        self.detalhes_comparacao = None
+        self.origens_referencias = []
+        self.imagem_resultado = None
+        self.mapas_comparacao = None
         
         # Variáveis de Simetria
         self.modo_simetria = "usuario" 
@@ -113,7 +175,14 @@ class BiometriaApp:
     def limpar_janela(self):
         self.is_verifying = False 
         self.cadastro_iniciado = False
-        self.is_camera_running = False 
+        self.encerrar_camera()
+        self.sessao_camera += 1
+        self.comparando = False
+        self.parar_processamento.set()
+        self.video_verificacao = False
+        if self.loop_processamento is not None:
+            self.root.after_cancel(self.loop_processamento)
+            self.loop_processamento = None
         if self.loop_id is not None:
             self.root.after_cancel(self.loop_id)
             self.loop_id = None
@@ -135,21 +204,147 @@ class BiometriaApp:
             json.dump({"pasta_armazenamento": novo_caminho}, f)
 
     def carregar_dados_biometricos(self):
-        known_encodings, known_names = [], []
-        if not os.path.exists(self.caminho_dataset): return known_encodings, known_names
-        for nome in os.listdir(self.caminho_dataset):
-            caminho_pessoa = os.path.join(self.caminho_dataset, nome)
-            if not os.path.isdir(caminho_pessoa): continue
-            encodings_pessoa = []
-            for arquivo in os.listdir(caminho_pessoa):
-                if arquivo.endswith(('.jpg', '.png')):
-                    img = face_recognition.load_image_file(os.path.join(caminho_pessoa, arquivo))
-                    encodes = face_recognition.face_encodings(img)
-                    if len(encodes) > 0: encodings_pessoa.append(encodes[0])
-            if len(encodings_pessoa) > 0:
-                known_encodings.append(np.mean(encodings_pessoa, axis=0))
-                known_names.append(nome)
-        return known_encodings, known_names
+        referencias, nomes, avisos = carregar_referencias(
+            self.caminho_dataset, self.marcar_olhos)
+        if avisos:
+            messagebox.showwarning("Referências não carregadas", "\n".join(avisos[:12]))
+        return referencias, nomes
+
+    def marcar_olhos(self, imagem, titulo="Marcar olhos"):
+        return self.selecionar_pontos(imagem, ("olho à esquerda na foto", "olho à direita na foto"), titulo)
+
+    def executar_processamento(self, tarefa, concluir):
+        """Cálculos fora do Tkinter; progresso, diálogos e resultado na thread da UI."""
+        self.parar_processamento.set()
+        parar = self.parar_processamento = threading.Event()
+        sessao = self.sessao_camera
+        mensagens = queue.Queue()
+        self.comparando = True
+        self.inicio_processamento = time.monotonic()
+
+        def progresso(fracao, texto):
+            if not parar.is_set():
+                mensagens.put(("progresso", (fracao, texto)))
+
+        def marcar(imagem, titulo):
+            pronto, resposta = threading.Event(), []
+            mensagens.put(("marcar", (imagem, titulo, pronto, resposta)))
+            while not pronto.wait(.05):
+                if parar.is_set():
+                    raise CancelledError()
+            return resposta[0]
+
+        def calcular():
+            try:
+                resultado = tarefa(progresso, parar, marcar)
+                if not parar.is_set():
+                    mensagens.put(("concluido", resultado))
+            except CancelledError:
+                pass
+            except Exception as erro:
+                import traceback
+                traceback.print_exc()
+                mensagens.put(("erro", str(erro) or type(erro).__name__))
+
+        def acompanhar():
+            self.loop_processamento = None
+            if parar.is_set() or sessao != self.sessao_camera:
+                return
+            acabou = False
+            while not mensagens.empty():
+                tipo, dados = mensagens.get_nowait()
+                if tipo == "progresso":
+                    fracao, texto = dados
+                    self.barra_progresso.config(value=100 * fracao)
+                    self.lbl_andamento.config(text=texto)
+                elif tipo == "marcar":
+                    imagem, titulo, pronto, resposta = dados
+                    try:
+                        resposta.append(self.marcar_olhos(imagem, titulo))
+                    finally:
+                        pronto.set()
+                    if parar.is_set() or sessao != self.sessao_camera:
+                        return
+                elif tipo in ("concluido", "erro"):
+                    acabou = True
+                    self.comparando = False
+                    self.barra_progresso.config(value=100 if tipo == "concluido" else 0)
+                    if tipo == "erro":
+                        self.lbl_comparacao.config(text="Não foi possível concluir a comparação", fg=self.c_warning)
+                        self.lbl_andamento.config(text=f"{dados}\nAjuste a captura e tente novamente.")
+                        self.btn_comparar.config(state=tk.NORMAL if self.referencias else tk.DISABLED)
+                        self.btn_nova_captura.config(state=tk.NORMAL)
+                    else:
+                        concluir(dados)
+                    break
+            if not acabou:
+                decorrido = time.monotonic() - self.inicio_processamento
+                self.lbl_tempo.config(text=f"Processando há {decorrido:.0f} s")
+                self.loop_processamento = self.root.after(40, acompanhar)
+            else:
+                self.lbl_tempo.config(text="")
+
+        self.thread_processamento = threading.Thread(target=calcular, daemon=True)
+        self.thread_processamento.start()
+        acompanhar()
+
+    def selecionar_pontos(self, imagem, rotulos, titulo, instrucoes=None):
+        """Marcações humanas; não há detector facial ou de landmarks oculto."""
+        janela = tk.Toplevel(self.root)
+        janela.title(titulo)
+        janela.configure(bg=self.bg_main)
+        janela.transient(self.root)
+        janela.grab_set()
+        if instrucoes:
+            tk.Label(janela, text=instrucoes, wraplength=680, justify=tk.LEFT,
+                     font=("Segoe UI", 10), bg=self.bg_main, fg=self.fg_muted).pack(padx=15, pady=(10, 0))
+        altura, largura = imagem.shape[:2]
+        escala = min(720 / largura, 450 / altura, 1.)
+        w, h = round(largura * escala), round(altura * escala)
+        aviso = tk.Label(janela, font=self.f_normal, bg=self.bg_main, fg=self.fg_text)
+        aviso.pack(padx=15, pady=10)
+        canvas = tk.Canvas(janela, width=w, height=h, highlightthickness=0, cursor="crosshair")
+        canvas.pack(padx=15)
+        foto = ImageTk.PhotoImage(Image.fromarray(cv2.cvtColor(imagem, cv2.COLOR_BGR2RGB)).resize((w, h)))
+        canvas.create_image(0, 0, anchor=tk.NW, image=foto)
+        pontos, resultado = [], []
+
+        def atualizar():
+            canvas.delete("marcas")
+            for i, (x, y) in enumerate(pontos):
+                px, py = x * w / largura, y * h / altura
+                canvas.create_oval(px-4, py-4, px+4, py+4, outline="#00FFFF", width=2, tags="marcas")
+                canvas.create_text(px+12, py-10, text=str(i+1), fill="#00FFFF", tags="marcas")
+            aviso.config(text=f"Clique no centro: {rotulos[len(pontos)]}" if len(pontos) < len(rotulos)
+                         else "Confira os pontos e confirme. As marcações não serão gravadas na foto.")
+            confirmar.config(state=tk.NORMAL if len(pontos) == len(rotulos) else tk.DISABLED)
+
+        def clicar(evento):
+            if len(pontos) < len(rotulos) and 0 <= evento.x < w and 0 <= evento.y < h:
+                pontos.append((evento.x * largura / w, evento.y * altura / h))
+                atualizar()
+
+        def desfazer():
+            if pontos:
+                pontos.pop()
+                atualizar()
+
+        def concluir():
+            if len(pontos) == len(rotulos):
+                resultado.extend(pontos)
+                janela.destroy()
+
+        botoes = tk.Frame(janela, bg=self.bg_main)
+        botoes.pack(pady=15)
+        confirmar = tk.Button(botoes, text="Confirmar", command=concluir)
+        confirmar.pack(side=tk.LEFT, padx=10)
+        tk.Button(botoes, text="Desfazer ponto", command=desfazer).pack(side=tk.LEFT, padx=10)
+        tk.Button(botoes, text="Cancelar", command=janela.destroy).pack(side=tk.LEFT, padx=10)
+        canvas.bind("<Button-1>", clicar)
+        janela.bind("<Escape>", lambda e: janela.destroy())
+        atualizar()
+        self.root.wait_window(janela)
+        return resultado or None
 
     # ---------------- TELA 1: MENU PRINCIPAL ----------------
     def construir_menu(self):
@@ -159,16 +354,16 @@ class BiometriaApp:
 
         tk.Label(card, text="⚙️", font=("Segoe UI", 36), bg=self.bg_card, fg=self.c_primary).pack(pady=(20, 0))
         tk.Label(card, text="Sistema de Biometria", font=self.f_title, bg=self.bg_card, fg=self.fg_text).pack()
-        tk.Label(card, text="Autenticação Neural - Álgebra 4", font=self.f_subtitle, bg=self.bg_card, fg=self.fg_muted).pack(pady=(0, 20))
+        tk.Label(card, text="Método clássico — pontos dominantes e M²HD", font=self.f_subtitle, bg=self.bg_card, fg=self.fg_muted).pack(pady=(0, 20))
 
         self.criar_botao(card, "Inscrever Novo Usuário", self.c_success, self.c_success_h, self.iniciar_cadastro, icone="📸").pack(pady=10)
-        self.criar_botao(card, "Verificar Acesso", self.c_primary, self.c_primary_h, self.iniciar_verificacao, icone="🔍").pack(pady=10)
+        self.criar_botao(card, "Reconhecer por Contornos", self.c_primary, self.c_primary_h, self.iniciar_verificacao, icone="🔍").pack(pady=10)
         self.criar_botao(card, "Análise de Simetria Facial", self.c_cyan, self.c_cyan_h, self.iniciar_simetria_lista, icone="📐").pack(pady=10)
         self.criar_botao(card, "Gerenciar Usuários", self.c_purple, self.c_purple_h, self.iniciar_lista_usuarios, icone="👥").pack(pady=10)
         self.criar_botao(card, "Armazenamento", self.c_warning, self.c_warning_h, self.iniciar_configuracoes, icone="📁").pack(pady=10)
         
         btn_sair = tk.Button(card, text="Sair do Sistema", font=("Segoe UI", 10, "underline"), bg=self.bg_card, fg=self.c_danger, 
-                             bd=0, activebackground=self.bg_card, activeforeground=self.c_danger_h, cursor="hand2", command=self.root.quit)
+                             bd=0, activebackground=self.bg_card, activeforeground=self.c_danger_h, cursor="hand2", command=self.fechar)
         btn_sair.pack(pady=20)
 
     # ---------------- TELA DE SIMETRIA 1: LISTA E UPLOAD ----------------
@@ -267,12 +462,34 @@ class BiometriaApp:
         caminho_pasta = os.path.join(self.caminho_dataset, nome_usuario)
         img_path = os.path.join(caminho_pasta, "foto_1.jpg")
         if not os.path.exists(img_path): 
-            fotos_disp = [f for f in os.listdir(caminho_pasta) if f.endswith(('.jpg', '.png'))]
+            fotos_disp = [f for f in os.listdir(caminho_pasta) if os.path.splitext(f)[1].lower() in EXTENSOES]
+            if not fotos_disp:
+                messagebox.showwarning("Sem fotos", "Conclua o cadastro de uma foto antes de analisar a simetria.")
+                return
             img_path = os.path.join(caminho_pasta, sorted(fotos_disp)[0])
         
         self.executar_preparativos_animacao(img_path)
 
     def executar_preparativos_animacao(self, img_path):
+        try:
+            imagem = ler_imagem(img_path)
+        except (OSError, ValueError) as erro:
+            messagebox.showerror("Imagem inválida", str(erro))
+            return
+        self.pontos_simetria = self.selecionar_pontos(imagem,
+            ("olho à esquerda na foto", "olho à direita na foto", "ponte do nariz",
+             "ponta do queixo", "extremidade do rosto à esquerda na foto",
+             "extremidade do rosto à direita na foto"),
+            "Simetria — marcar seis pontos",
+            instrucoes="Use uma foto frontal, com expressão neutra. Marque dois pontos equivalentes "
+                       "nas laterais do contorno do rosto. Esquerda e direita são os lados da foto.")
+        if self.pontos_simetria is None:
+            return
+        try:
+            calcular_simetria_manual(self.pontos_simetria)
+        except ValueError as erro:
+            messagebox.showwarning("Confira as marcações", str(erro))
+            return
         self.limpar_janela()
         self.canvas = tk.Canvas(self.root, bg=self.bg_main, highlightthickness=0)
         self.canvas.pack(fill=tk.BOTH, expand=True)
@@ -311,7 +528,7 @@ class BiometriaApp:
         rx, ry = w//2, h//2
         
         if self.anim_fase == 1:
-            txt_status = "📡 EXTRAINDO FOTO FRONTAL DO SERVIDOR..." if self.modo_simetria == "usuario" else "📂 CARREGANDO FOTO LOCAL DA MEMÓRIA..."
+            txt_status = "📂 CARREGANDO FOTO FRONTAL LOCAL..." if self.modo_simetria == "usuario" else "📂 CARREGANDO FOTO LOCAL DA MEMÓRIA..."
             self.canvas.create_text(rx, 100, text=txt_status, fill=self.c_cyan, font=("Consolas", 16, "bold"))
             
             self.canvas.create_rectangle(rx - 60, 150, rx + 60, 230, fill="#2A2A2A", outline=self.c_cyan, width=3)
@@ -379,45 +596,24 @@ class BiometriaApp:
     # ---------------- LÓGICA MATEMÁTICA CENTRAL (REUTILIZÁVEL) ----------------
     def thread_calcular_simetria_matematica(self, img_path):
         try:
-            image = face_recognition.load_image_file(img_path)
-            landmarks_list = face_recognition.face_landmarks(image)
-            
-            if landmarks_list:
-                marcas = landmarks_list[0]
-                
-                nariz_ponto = marcas['nose_bridge'][0] 
-                olho_esq = np.mean(marcas['left_eye'], axis=0)
-                olho_dir = np.mean(marcas['right_eye'], axis=0)
-                mandibula_esq = marcas['chin'][2]
-                mandibula_dir = marcas['chin'][14]
-                
-                dist_olho_esq = abs(nariz_ponto[0] - olho_esq[0])
-                dist_olho_dir = abs(olho_dir[0] - nariz_ponto[0])
-                diff_olhos = abs(dist_olho_esq - dist_olho_dir)
-                
-                dist_man_esq = abs(nariz_ponto[0] - mandibula_esq[0])
-                dist_man_dir = abs(mandibula_dir[0] - nariz_ponto[0])
-                diff_man = abs(dist_man_esq - dist_man_dir)
-                
-                largura_total = abs(marcas['chin'][16][0] - marcas['chin'][0][0])
-                
-                if largura_total > 0:
-                    erro = diff_olhos + diff_man
-                    pontuacao = max(0, 100 - ((erro / largura_total) * 100 * 2.5)) 
-                    
-                    self.resultado_matematico = {
-                        "erro": False, 
-                        "final": pontuacao, 
-                        "dados": [{
-                            "olhos": f"Esq: {dist_olho_esq:.1f}px | Dir: {dist_olho_dir:.1f}px",
-                            "mandib": f"Esq: {dist_man_esq:.1f}px | Dir: {dist_man_dir:.1f}px",
-                            "score": pontuacao
-                        }]
-                    }
-                    return
-        except: pass
-            
-        self.resultado_matematico = {"erro": True}
+            medidas = calcular_simetria_manual(self.pontos_simetria)
+            olho_esq, olho_dir = medidas["distancias_olhos"]
+            extremo_esq, extremo_dir = medidas["distancias_extremidades"]
+            queixo_x, queixo_y = medidas["queixo_alinhado"]
+            self.resultado_matematico = {
+                "erro": False, "final": medidas["pontuacao"], "medidas": medidas,
+                "dados": [{
+                    "olhos": f"Esq: {olho_esq:.1f}px | Dir: {olho_dir:.1f}px (referência)",
+                    "extremidades": f"Esq: {extremo_esq:.1f}px | Dir: {extremo_dir:.1f}px\n"
+                                    f"Desnível: {medidas['desnivel_extremidades']:.1f}px",
+                    "nariz": f"Desvio do eixo: {medidas['desvio_nariz']:.1f}px",
+                    "queixo": f"Desvio do eixo: {abs(queixo_x):.1f}px\n"
+                              f"Altura abaixo dos olhos: {queixo_y:.1f}px",
+                    "largura": f"{medidas['largura']:.1f}px",
+                }],
+            }
+        except ValueError as erro:
+            self.resultado_matematico = {"erro": True, "mensagem": str(erro)}
 
     # ---------------- TELA DE SIMETRIA 3: RESULTADO ÚNICO FRONTAL ----------------
     def mostrar_resultados_simetria(self):
@@ -426,7 +622,8 @@ class BiometriaApp:
         tk.Label(self.root, text="✅ Análise Concluída", font=self.f_title, bg=self.bg_main, fg=self.c_success).pack(pady=(30, 10))
         
         if self.resultado_matematico["erro"]:
-            tk.Label(self.root, text="Erro: Não foi possível detectar os vetores faciais (Landmarks) nesta foto.", bg=self.bg_main, fg=self.c_danger).pack()
+            tk.Label(self.root, text=self.resultado_matematico.get("mensagem", "Confira as seis marcações."),
+                     wraplength=760, bg=self.bg_main, fg=self.c_danger).pack()
             self.criar_botao(self.root, "Voltar", self.c_gray, self.c_gray_h, self.iniciar_simetria_lista).pack(pady=20)
             return
 
@@ -442,10 +639,11 @@ class BiometriaApp:
                                cursor="hand2", width=3, command=self.mostrar_teoria_matematica)
         btn_teoria.pack(side=tk.LEFT, padx=10)
         
-        tk.Label(self.root, text="Grau de Simetria Bilateral Encontrado na Foto", font=self.f_normal, bg=self.bg_main, fg=self.fg_muted).pack()
+        tk.Label(self.root, text="Estimativa geométrica de simetria com seis pontos", font=self.f_normal,
+                 bg=self.bg_main, fg=self.fg_muted).pack()
 
         frame_fotos = tk.Frame(self.root, bg=self.bg_main)
-        frame_fotos.pack(pady=30)
+        frame_fotos.pack(pady=15)
         
         if len(self.resultado_matematico["dados"]) > 0:
             dados = self.resultado_matematico["dados"][0]
@@ -453,49 +651,87 @@ class BiometriaApp:
             card.pack(padx=15)
             
             if self.fotos_animacao:
-                tk.Label(card, image=self.fotos_animacao[0], bg=self.bg_card).pack(padx=20, pady=20)
+                tk.Label(card, image=self.fotos_animacao[0], bg=self.bg_card).pack(side=tk.LEFT, padx=15, pady=15)
+            detalhes = tk.Frame(card, bg=self.bg_card)
+            detalhes.pack(side=tk.LEFT, padx=15, pady=12)
             
-            tk.Label(card, text="Distância Euclidiana Central", font=("Segoe UI", 11, "bold"), bg=self.bg_card, fg=self.c_primary).pack()
-            tk.Label(card, text=f"Olhos:\n{dados['olhos']}", font=("Consolas", 10), bg=self.bg_card, fg="#FFFFFF").pack(pady=5)
-            tk.Label(card, text=f"Maxilar:\n{dados['mandib']}", font=("Consolas", 10), bg=self.bg_card, fg="#FFFFFF").pack(pady=5, padx=20)
+            tk.Label(detalhes, text="Medidas no rosto alinhado", font=("Segoe UI", 11, "bold"),
+                     bg=self.bg_card, fg=self.c_primary).pack(anchor="w", pady=(0, 5))
+            for rotulo, chave in (("Olhos", "olhos"), ("Extremidades", "extremidades"),
+                                  ("Nariz", "nariz"), ("Queixo", "queixo"), ("Largura facial", "largura")):
+                tk.Label(detalhes, text=f"{rotulo}: {dados[chave]}", justify=tk.LEFT, wraplength=490,
+                         font=("Consolas", 10), bg=self.bg_card, fg="#FFFFFF").pack(anchor="w", pady=3)
+
+        tk.Label(self.root, text="Use foto frontal e pontos equivalentes nas laterais. "
+                 "A pontuação é didática, não uma avaliação clínica.", wraplength=780,
+                 font=("Segoe UI", 10), bg=self.bg_main, fg=self.fg_muted).pack(pady=5)
 
         self.criar_botao(self.root, "Concluir e Voltar", self.c_gray, self.c_gray_h, self.iniciar_simetria_lista, largura=20).pack(pady=20)
 
     def mostrar_teoria_matematica(self):
         teoria = (
             "CÁLCULO ALGÉBRICO DE SIMETRIA FACIAL\n\n"
-            "O motor utiliza Análise de Landmarks para criar um vetor de 68 coordenadas (X, Y) do rosto humano.\n\n"
+            "O usuário marca seis pontos: dois olhos, ponte do nariz, ponta do queixo e duas laterais do rosto.\n"
+            "Esta ferramenta de simetria é separada do reconhecimento por M²HD.\n\n"
             "1. Eixo de Referência Central: \n"
-            "Traçamos um eixo Y vertical imaginário a partir da ponte do nariz do usuário (ponto de origem central).\n\n"
-            "2. Distância Euclidiana Bilateral: \n"
-            "O algoritmo calcula o Módulo da Distância |x1 - x2| entre as extremidades esquerdas (olho e maxilar) "
-            "e as extremidades direitas em relação ao eixo central.\n\n"
-            "3. Relação de Erro: \n"
-            "A diferença absoluta entre os lados esquerdo e direito é dividida pela largura total do rosto. "
-            "Isso gera a taxa de assimetria. O resultado final que você vê na tela é: (100% - Margem de Assimetria)."
+            "A linha dos olhos corrige a inclinação. Sua metade define a origem, e o eixo perpendicular "
+            "é a referência central. Os olhos servem ao alinhamento, não recebem uma nota própria.\n\n"
+            "2. Reflexão e distâncias em duas dimensões:\n"
+            "Refletimos uma extremidade (x, y) em (-x, y) e medimos a distância até a outra. "
+            "Também comparamos nariz e queixo com suas próprias posições refletidas. "
+            "A altura do queixo é mostrada; mudar somente sua altura não indica assimetria bilateral.\n\n"
+            "3. Normalização e pontuação:\n"
+            "Dividimos os três erros pela largura facial e calculamos sua média. "
+            "Pontuação = máximo(0, 100 × (1 - erro médio)). "
+            "É uma medida geométrica didática, sensível às marcações, pose e expressão."
         )
         messagebox.showinfo("Teoria da Simetria - Álgebra 4", teoria)
 
     # ---------------- DEMAIS CONFIGURAÇÕES E CÂMERA MANTIDAS ----------------
     def iniciar_camera_assincrona(self):
+        self.encerrar_camera()
+        if self.thread_camera is not None:
+            self.thread_camera.join(timeout=1)
         self.is_camera_running = True
         self.frame_atual_camera = None
+        self.erro_camera = None
+        self.parar_camera = threading.Event()
+        parar = self.parar_camera
         def leitor_camera():
-            self.cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
-            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-            while self.is_camera_running:
-                ret, frame = self.cap.read()
-                if ret: self.frame_atual_camera = cv2.flip(frame, 1)
-                else: time.sleep(0.01)
-            if self.cap is not None:
-                self.cap.release()
-                self.cap = None
-        threading.Thread(target=leitor_camera, daemon=True).start()
+            cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+            try:
+                if not cap.isOpened():
+                    if not parar.is_set():
+                        self.erro_camera = "Camera indisponivel. Verifique a conexao."
+                    return
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                while not parar.is_set():
+                    ret, frame = cap.read()
+                    if ret and not parar.is_set():
+                        self.frame_atual_camera = cv2.flip(frame, 1)
+                    elif not ret:
+                        if not parar.is_set():
+                            self.erro_camera = "Falha na leitura da camera. Reabra a captura."
+                            self.frame_atual_camera = None
+                        return
+            finally:
+                cap.release()
+        self.thread_camera = threading.Thread(target=leitor_camera, daemon=True)
+        self.thread_camera.start()
+
+    def encerrar_camera(self):
+        self.is_camera_running = False
+        self.parar_camera.set()
+
+    def fechar(self):
+        self.limpar_janela()
+        self.root.destroy()
 
     def exibir_tela_carregamento(self):
         img_loading = np.zeros((480, 640, 3), dtype=np.uint8)
-        cv2.putText(img_loading, "Ativando sensor optico...", (180, 240), cv2.FONT_HERSHEY_DUPLEX, 0.7, (255, 193, 7), 1)
+        texto = self.erro_camera or "Ativando sensor optico..."
+        cv2.putText(img_loading, texto, (20, 240), cv2.FONT_HERSHEY_DUPLEX, 0.6, (255, 193, 7), 1)
         self.exibir_frame_tkinter(img_loading)
 
     def iniciar_configuracoes(self):
@@ -558,10 +794,13 @@ class BiometriaApp:
 
     def iniciar_cadastro(self):
         nome = simpledialog.askstring("Identificação", "Insira o nome completo do novo usuário:")
-        if not nome: return 
+        if not nome or not nome.strip(): return
         self.nome_cadastro = nome.strip().title()
+        if self.nome_cadastro in (".", "..") or any(c in self.nome_cadastro for c in '<>:"/\\|?*'):
+            messagebox.showwarning("Nome inválido", "Use um nome sem caracteres de caminho ou de arquivo.")
+            return
         self.diretorio_cadastro = os.path.join(self.caminho_dataset, self.nome_cadastro)
-        self.fotos_tiradas, self.cadastro_iniciado, self.rosto_alinhado, self.cache_rostos_cadastro = 0, False, False, []
+        self.cadastro_iniciado = False
         if not os.path.exists(self.diretorio_cadastro): os.makedirs(self.diretorio_cadastro)
         self.limpar_janela()
         self.frame_botoes_camera = self.construir_tela_camera(f"Cadastrando: {self.nome_cadastro}")
@@ -574,55 +813,37 @@ class BiometriaApp:
         if not self.cadastro_iniciado:
             self.criar_botao(self.frame_botoes_camera, "Começar", self.c_primary, self.c_primary_h, self.ativar_estado_captura, largura=25, icone="▶️").pack(side=tk.LEFT, padx=15)
         else:
-            self.criar_botao(self.frame_botoes_camera, f"Extrair Biometria ({self.fotos_tiradas}/3)", self.c_success, self.c_success_h, self.capturar_foto_cadastro, largura=25, icone="📸").pack(side=tk.LEFT, padx=15)
+            self.criar_botao(self.frame_botoes_camera, "Capturar Foto Frontal", self.c_success, self.c_success_h, self.capturar_foto_cadastro, largura=25, icone="📸").pack(side=tk.LEFT, padx=15)
         self.criar_botao(self.frame_botoes_camera, "Cancelar", self.c_danger, self.c_danger_h, self.construir_menu, largura=20, icone="⏹️").pack(side=tk.LEFT, padx=15)
 
     def ativar_estado_captura(self):
         self.cadastro_iniciado = True
         self.atualizar_botoes_cadastro()
-        threading.Thread(target=self.thread_ia_cadastro, daemon=True).start()
-
-    def thread_ia_cadastro(self):
-        while self.is_camera_running and self.cadastro_iniciado:
-            if self.frame_atual_camera is not None:
-                rgb_small = cv2.cvtColor(cv2.resize(self.frame_atual_camera, (0, 0), fx=0.25, fy=0.25), cv2.COLOR_BGR2RGB)
-                self.cache_rostos_cadastro = face_recognition.face_locations(rgb_small, model="hog")
-                time.sleep(0.05)
-            else: time.sleep(0.02)
 
     def loop_cadastro(self):
         if not self.is_camera_running: return
         if self.frame_atual_camera is not None:
             frame = self.frame_atual_camera.copy()
-            self.frame_atual_limpo = self.frame_atual_camera.copy() 
             h, w = frame.shape[:2]
-            ox, oy, rx, ry = w // 2, h // 2, 120, 160 
+            ox = w // 2
             if not self.cadastro_iniciado:
-                cv2.ellipse(frame, (ox, oy), (rx, ry), 0, 0, 360, (0, 255, 255), 2, cv2.LINE_AA)
+                self.desenhar_molde_rosto(frame, (0, 255, 255))
                 self.desenhar_texto_fundo_escuro(frame, "Clique no botao COMECAR abaixo", ox, h - 35, (0, 255, 255))
             else:
-                self.rosto_alinhado = False
-                if len(self.cache_rostos_cadastro) > 0:
-                    t, r, b, l = [v*4 for v in self.cache_rostos_cadastro[0]]
-                    fw, fh = r - l, b - t  
-                    cx, cy = l + fw // 2, t + fh // 2 
-                    if 120 < fw < 280 and abs(cx - ox) < 50 and abs(cy - oy) < 60: self.rosto_alinhado = True
-                cor_molde = (0, 255, 0) if self.rosto_alinhado else (0, 0, 255)
-                cv2.ellipse(frame, (ox, oy), (rx, ry), 0, 0, 360, cor_molde, 2, cv2.LINE_AA)
-                instrucao = ""
-                if self.rosto_alinhado:
-                    if self.fotos_tiradas == 0: instrucao = "Olhe diretamente para a FRENTE"
-                    elif self.fotos_tiradas == 1:
-                        instrucao = "Vire o rosto para a DIREITA"
-                        cv2.arrowedLine(frame, (ox + rx + 30, oy), (ox + rx + 100, oy), cor_molde, 5, cv2.LINE_AA, tipLength=0.3)
-                    elif self.fotos_tiradas == 2:
-                        instrucao = "Vire o rosto para a ESQUERDA"
-                        cv2.arrowedLine(frame, (ox - rx - 30, oy), (ox - rx - 100, oy), cor_molde, 5, cv2.LINE_AA, tipLength=0.3)
-                else: instrucao = "Encaixe o rosto no molde!"
+                cor_molde = (255, 255, 0)
+                self.desenhar_molde_rosto(frame, cor_molde)
+                instrucao = "Capture uma foto frontal e marque os olhos"
                 self.desenhar_texto_fundo_escuro(frame, instrucao, ox, h - 35, cor_molde)
             self.exibir_frame_tkinter(frame)
         else: self.exibir_tela_carregamento()
         self.loop_id = self.root.after(15, self.loop_cadastro)
+
+    def desenhar_molde_rosto(self, frame, cor=(255, 255, 0)):
+        """Guia visual comum ao cadastro e reconhecimento, desenhada só na prévia."""
+        h, w = frame.shape[:2]
+        escala = min(w / 640, h / 480)
+        raios = (max(1, round(120 * escala)), max(1, round(160 * escala)))
+        cv2.ellipse(frame, (w // 2, h // 2), raios, 0, 0, 360, cor, 2, cv2.LINE_AA)
 
     def desenhar_texto_fundo_escuro(self, frame, texto, x_centro, y, cor):
         texto_size = cv2.getTextSize(texto, cv2.FONT_HERSHEY_DUPLEX, 0.7, 1)[0]
@@ -631,68 +852,227 @@ class BiometriaApp:
         cv2.putText(frame, texto, (x_inicio, y), cv2.FONT_HERSHEY_DUPLEX, 0.7, cor, 1, cv2.LINE_AA)
 
     def capturar_foto_cadastro(self):
-        if not self.rosto_alinhado:
-            messagebox.showwarning("Atenção", "O rosto está mal posicionado!\n\nPor favor, alinhe-se até que o molde fique VERDE.")
+        if self.frame_atual_camera is None:
+            messagebox.showwarning("Câmera", "Aguarde uma imagem válida da câmera.")
             return
-        cv2.imwrite(os.path.join(self.diretorio_cadastro, f"foto_{self.fotos_tiradas+1}.jpg"), self.frame_atual_limpo)
-        self.fotos_tiradas += 1
-        if self.fotos_tiradas == 3:
-            messagebox.showinfo("Operação Concluída", f"Matriz facial de {self.nome_cadastro} gerada e salva com sucesso.")
-            self.construir_menu()
-        else: self.atualizar_botoes_cadastro() 
+        imagem = self.frame_atual_camera.copy()
+        olhos = self.marcar_olhos(imagem, "Cadastro — alinhar foto frontal")
+        if olhos is None:
+            return
+        try:
+            extrair_descritor(normalizar_rosto(imagem, olhos))
+            indice = 1
+            while os.path.exists(os.path.join(self.diretorio_cadastro, f"foto_{indice}.jpg")):
+                indice += 1
+            caminho = os.path.join(self.diretorio_cadastro, f"foto_{indice}.jpg")
+            # Salva a captura limpa, nunca as guias, pontos ou texto da tela.
+            Image.fromarray(cv2.cvtColor(imagem, cv2.COLOR_BGR2RGB)).save(caminho, quality=95)
+            salvar_olhos(caminho, olhos)
+        except (OSError, ValueError, cv2.error) as erro:
+            messagebox.showerror("Captura não salva", str(erro))
+            return
+        messagebox.showinfo("Cadastro concluído", f"A foto frontal de {self.nome_cadastro} foi salva com sucesso.")
+        self.construir_menu()
 
     def iniciar_verificacao(self):
-        self.vetores, self.nomes = self.carregar_dados_biometricos()
-        if len(self.vetores) == 0:
-            messagebox.showwarning("Aviso", "O banco de dados está vazio. Cadastre alguém primeiro.")
-            return
         self.limpar_janela()
-        frame_botoes = self.construir_tela_camera("🔍 Escaneamento em Tempo Real")
-        self.criar_botao(frame_botoes, "Encerrar Câmera", self.c_danger, self.c_danger_h, self.construir_menu, largura=20, icone="⏹️").pack(side=tk.LEFT, padx=15)
-        self.is_verifying, self.cache_resultados_ia = True, []
+        self.referencias, self.nomes, self.origens_referencias = [], [], []
+        self.detalhes_comparacao = None
+        self.mapas_comparacao = None
+        self.captura_verificacao = self.imagem_resultado = None
+        self.resultado_comparacao = None
+        self.video_verificacao = True
+        tk.Label(self.root, text="Reconhecimento por contornos", font=self.f_title,
+                 bg=self.bg_main, fg=self.fg_text).pack(pady=(15, 5))
+        # O resultado vem antes do vídeo, sem depender do espaço que sobrar na janela.
+        self.lbl_comparacao = tk.Label(self.root, text="Preparando as fotos cadastradas...",
+            bg=self.bg_main, fg=self.fg_text, font=("Segoe UI", 16, "bold"), wraplength=850)
+        self.lbl_comparacao.pack(pady=5)
+        self.lbl_andamento = tk.Label(self.root, text="A câmera pode ser posicionada enquanto a base carrega.",
+            bg=self.bg_main, fg=self.fg_muted, font=self.f_normal, wraplength=850)
+        self.lbl_andamento.pack()
+        self.barra_progresso = ttk.Progressbar(self.root, maximum=100, length=550)
+        self.barra_progresso.pack(pady=5)
+        self.lbl_tempo = tk.Label(self.root, text="", bg=self.bg_main, fg=self.fg_muted)
+        self.lbl_tempo.pack()
+        self.lbl_video = tk.Label(self.root, bg="black")
+        self.lbl_video.pack(pady=5)
+        frame_botoes = tk.Frame(self.root, bg=self.bg_main)
+        frame_botoes.pack(pady=10)
+        self.btn_comparar = self.criar_botao(frame_botoes, "Comparar captura", self.c_primary, self.c_primary_h,
+                         self.comparar_captura, largura=20, icone="📸")
+        self.btn_comparar.pack(side=tk.LEFT, padx=10)
+        self.btn_nova_captura = self.criar_botao(frame_botoes, "Nova captura", self.c_gray, self.c_gray_h,
+                         self.nova_captura, largura=15)
+        self.btn_nova_captura.pack(side=tk.LEFT, padx=10)
+        self.criar_botao(frame_botoes, "Voltar", self.c_danger, self.c_danger_h,
+                         self.construir_menu, largura=12).pack(side=tk.LEFT, padx=10)
+        frame_exportacao = tk.Frame(self.root, bg=self.bg_main)
+        frame_exportacao.pack()
+        self.btn_detalhes = tk.Button(frame_exportacao, text="Ver detalhes da comparação", command=self.mostrar_detalhes_comparacao,
+            bg=self.bg_card, fg=self.fg_text, bd=0, padx=15, pady=5, state=tk.DISABLED)
+        self.btn_detalhes.pack(side=tk.LEFT, padx=5)
+        self.btn_salvar_contornos = tk.Button(frame_exportacao, text="Salvar contornos", command=self.salvar_contornos_comparacao,
+            bg=self.bg_card, fg=self.fg_text, bd=0, padx=15, pady=5, state=tk.DISABLED)
+        self.btn_salvar_contornos.pack(side=tk.LEFT, padx=5)
+        self.btn_comparar.config(state=tk.DISABLED)
+        self.btn_nova_captura.config(state=tk.DISABLED)
+        self.is_verifying = True
         self.iniciar_camera_assincrona()
-        threading.Thread(target=self.thread_ia_reconhecimento, daemon=True).start()
         self.loop_verificacao()
 
-    def thread_ia_reconhecimento(self):
-        while self.is_verifying:
-            if self.frame_atual_camera is not None:
-                frame_atual = self.frame_atual_camera.copy()
-                rgb_small = cv2.cvtColor(cv2.resize(frame_atual, (0, 0), fx=0.25, fy=0.25), cv2.COLOR_BGR2RGB)
-                locs = face_recognition.face_locations(rgb_small, model="hog")
-                if len(locs) > 0:
-                    encodings = face_recognition.face_encodings(rgb_small, locs)
-                    resultados = []
-                    for i, encoding in enumerate(encodings):
-                        dist = face_recognition.face_distance(self.vetores, encoding)
-                        nome = "ACESSO NEGADO"
-                        if len(dist) > 0 and dist[np.argmin(dist)] <= 0.5: nome = self.nomes[np.argmin(dist)]
-                        resultados.append((locs[i], nome))
-                    self.cache_resultados_ia = resultados
-                else: self.cache_resultados_ia = [] 
-                time.sleep(0.05) 
-            else: time.sleep(0.02)
+        def carregar(progresso, parar, marcar):
+            origens = []
+            referencias, nomes, avisos = carregar_referencias(self.caminho_dataset,
+                marcar_olhos=marcar, progresso=progresso, cancelar=parar, origens=origens)
+            return referencias, nomes, avisos, origens
+
+        def base_pronta(dados):
+            self.referencias, self.nomes, avisos, self.origens_referencias = dados
+            self.btn_nova_captura.config(state=tk.NORMAL)
+            if self.referencias:
+                self.btn_comparar.config(state=tk.NORMAL)
+                self.lbl_comparacao.config(text="Pronto para comparar", fg=self.fg_text)
+                self.lbl_andamento.config(text=f"{len(set(self.nomes))} pessoa(s), {len(self.referencias)} foto(s). "
+                    "Encaixe o rosto inteiro no molde antes de comparar."
+                    + (f" {len(avisos)} foto(s) ignorada(s)." if avisos else ""))
+            else:
+                self.lbl_comparacao.config(text="Nenhuma foto válida disponível", fg=self.c_warning)
+                self.lbl_andamento.config(text="Cadastre fotos frontais para começar. " + (avisos[0] if avisos else ""))
+        self.executar_processamento(carregar, base_pronta)
+
+    def nova_captura(self):
+        if self.comparando:
+            return
+        self.captura_verificacao = None
+        self.resultado_comparacao = None
+        self.imagem_resultado = self.detalhes_comparacao = None
+        self.mapas_comparacao = None
+        self.btn_detalhes.config(state=tk.DISABLED)
+        self.btn_salvar_contornos.config(state=tk.DISABLED)
+        self.barra_progresso.config(value=0)
+        if self.referencias:
+            self.lbl_comparacao.config(text="Pronto para comparar", fg=self.fg_text)
+            self.lbl_andamento.config(text="Encaixe o rosto inteiro no molde. Afaste-se se necessário e clique em Comparar captura.")
+        else:
+            self.lbl_comparacao.config(text="Nenhuma foto válida disponível", fg=self.c_warning)
+            self.lbl_andamento.config(text="Volte ao menu e cadastre fotos frontais para começar.")
+
+    def comparar_captura(self):
+        if self.comparando or not self.referencias:
+            return
+        if self.frame_atual_camera is None:
+            self.lbl_comparacao.config(text="Aguardando imagem da câmera", fg=self.c_warning)
+            self.lbl_andamento.config(text=self.erro_camera or "Aguarde a câmera iniciar e tente novamente.")
+            return
+        imagem = self.frame_atual_camera.copy()
+        olhos = self.marcar_olhos(imagem, "Reconhecimento — alinhar captura")
+        if olhos is None:
+            return
+        self.captura_verificacao = imagem
+        self.resultado_comparacao = None
+        self.imagem_resultado = self.detalhes_comparacao = None
+        self.mapas_comparacao = None
+        referencias, nomes = self.referencias, self.nomes
+        origens = self.origens_referencias
+        self.btn_comparar.config(state=tk.DISABLED)
+        self.btn_nova_captura.config(state=tk.DISABLED)
+        self.btn_detalhes.config(state=tk.DISABLED)
+        self.btn_salvar_contornos.config(state=tk.DISABLED)
+        self.lbl_comparacao.config(text="Analisando a captura...", fg=self.fg_text)
+        self.lbl_andamento.config(text="Alinhando o rosto e extraindo seus contornos.")
+        self.barra_progresso.config(value=0)
+
+        def calcular(progresso, parar, marcar):
+            recorte = normalizar_rosto(imagem, olhos)
+            descritor = extrair_descritor(recorte,
+                progresso=lambda f, t: progresso(.8 * f, t), cancelar=parar)
+            ranking = classificar(descritor, referencias, nomes,
+                progresso=lambda f, t: progresso(.8 + .2 * f, t), cancelar=parar)
+            if not ranking:
+                raise ValueError("A base não contém fotos válidas para a comparação.")
+            indice = min((i for i, nome in enumerate(nomes) if nome == ranking[0][0]),
+                         key=lambda i: distancia_m2hd(referencias[i], descritor))
+            referencia = None
+            if indice < len(origens):
+                origem = origens[indice]
+                try:
+                    referencia = normalizar_rosto(ler_imagem(origem["caminho"]), origem["olhos"])
+                except (OSError, ValueError, cv2.error):
+                    pass
+            return ranking, len(descritor), recorte, referencia, descritor, referencias[indice]
+
+        def mostrar(dados):
+            ranking, quantidade, recorte, referencia, descritor, descritor_referencia = dados
+            self.resultado_comparacao = (ranking, quantidade, None)
+            self.detalhes_comparacao = dados[:2]
+            self.lbl_comparacao.config(text=f"Melhor correspondência: {ranking[0][0]}", fg=self.c_cyan)
+            self.lbl_andamento.config(text="Comparação concluída. Veja a captura e a foto cadastrada abaixo.")
+            self.btn_comparar.config(state=tk.NORMAL)
+            self.btn_nova_captura.config(state=tk.NORMAL)
+            self.btn_detalhes.config(state=tk.NORMAL)
+            self.mapas_comparacao = [("Captura analisada", recorte, descritor)]
+            if referencia is not None:
+                self.mapas_comparacao.append((f"Referência: {ranking[0][0]}", referencia, descritor_referencia))
+            self.btn_salvar_contornos.config(state=tk.NORMAL)
+            painel = np.full((240, 340, 3), 24, dtype=np.uint8)
+            painel[35:235, :160] = recorte
+            if referencia is not None:
+                painel[35:235, 180:340] = referencia
+            cv2.putText(painel, "Captura", (4, 23), cv2.FONT_HERSHEY_SIMPLEX, .5, (255, 255, 255), 1)
+            cv2.putText(painel, "Foto cadastrada" if referencia is not None else "Sem previa",
+                        (182, 23), cv2.FONT_HERSHEY_SIMPLEX, .45, (255, 255, 255), 1)
+            self.imagem_resultado = cv2.resize(painel, (476, 336))
+            self.exibir_frame_tkinter(self.imagem_resultado)
+        self.executar_processamento(calcular, mostrar)
+
+    def salvar_contornos_comparacao(self):
+        if not self.mapas_comparacao:
+            return
+        pasta = os.path.join(BASE_DIR, "exportacoes")
+        try:
+            os.makedirs(pasta, exist_ok=True)
+            caminho = filedialog.asksaveasfilename(title="Salvar contornos e pontos dominantes",
+                initialdir=pasta, initialfile="comparacao_contornos.png", defaultextension=".png",
+                filetypes=[("Imagem PNG", "*.png")])
+            if not caminho:
+                return
+            salvar_painel_contornos(caminho, self.mapas_comparacao)
+            messagebox.showinfo("Contornos salvos", f"Mapa dos contornos e pontos dominantes salvo em:\n{caminho}")
+        except (OSError, ValueError, cv2.error) as erro:
+            messagebox.showerror("Falha na exportação", str(erro))
+
+    def mostrar_detalhes_comparacao(self):
+        if self.detalhes_comparacao is None:
+            return
+        ranking, quantidade = self.detalhes_comparacao
+        texto = f"{quantidade} pontos dominantes na captura.\n\n"
+        texto += "\n".join(f"{i}. {nome}: {distancia:.2f} pixels" for i, (nome, distancia) in enumerate(ranking, 1))
+        texto += ("\n\nMenor distância M²HD indica contornos mais próximos. "
+                  "A distância não é uma porcentagem de confiança. "
+                  "O ranking compara os cadastros disponíveis; não confirma que uma pessoa desconhecida pertence à base.")
+        messagebox.showinfo("Detalhes da comparação geométrica", texto)
 
     def loop_verificacao(self):
         if not self.is_verifying: return
-        if self.frame_atual_camera is not None:
-            frame = self.frame_atual_camera.copy()
-            for (top, right, bottom, left), name in self.cache_resultados_ia:
-                t, r, b, l = top * 4, right * 4, bottom * 4, left * 4
-                cor = (0, 255, 0) if name != "ACESSO NEGADO" else (0, 0, 255)
-                L, thickness = 20, 3
-                for (x1,y1, x2,y2) in [(l,t, l+L,t), (l,t, l,t+L), (r,t, r-L,t), (r,t, r,t+L), (l,b, l+L,b), (l,b, l,b-L), (r,b, r-L,b), (r,b, r,b-L)]:
-                    cv2.line(frame, (x1, y1), (x2, y2), cor, thickness)
-                overlay = frame.copy()
-                cv2.rectangle(overlay, (l, b), (r, b + 35), cor, cv2.FILLED)
-                cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
-                cv2.putText(frame, name.upper(), (l + 8, b + 24), cv2.FONT_HERSHEY_DUPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
+        if self.imagem_resultado is not None:
+            pass  # Resultado estático já renderizado; não converter a mesma imagem a cada quadro.
+        elif self.captura_verificacao is not None or self.frame_atual_camera is not None:
+            frame = (self.captura_verificacao if self.captura_verificacao is not None
+                     else self.frame_atual_camera).copy()
+            if self.captura_verificacao is None:
+                self.desenhar_molde_rosto(frame)
+                h, w = frame.shape[:2]
+                self.desenhar_texto_fundo_escuro(frame, "Encaixe o rosto inteiro no molde", w // 2, h - 55, (255, 255, 0))
+                self.desenhar_texto_fundo_escuro(frame, "Afaste-se se o rosto ultrapassar a guia", w // 2, h - 25, (255, 255, 0))
             self.exibir_frame_tkinter(frame)
         else: self.exibir_tela_carregamento()
         self.loop_id = self.root.after(15, self.loop_verificacao)
 
     def exibir_frame_tkinter(self, frame_cv2):
-        imgtk = ImageTk.PhotoImage(image=Image.fromarray(cv2.cvtColor(frame_cv2, cv2.COLOR_BGR2RGB)))
+        imagem = Image.fromarray(cv2.cvtColor(frame_cv2, cv2.COLOR_BGR2RGB))
+        imagem.thumbnail((640, 340) if getattr(self, "video_verificacao", False) else (640, 480))
+        imgtk = ImageTk.PhotoImage(image=imagem)
         self.lbl_video.imgtk = imgtk 
         self.lbl_video.configure(image=imgtk)
 
@@ -700,3 +1080,4 @@ if __name__ == "__main__":
     app_root = tk.Tk()
     app = BiometriaApp(app_root)
     app_root.mainloop()
+    app.encerrar_camera()

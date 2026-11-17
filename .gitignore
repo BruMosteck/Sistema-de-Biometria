@@ -30,6 +30,7 @@ dist/
 # Dados locais e credenciais
 dataset/
 comAPI/modelos/
+semAPI/exportacoes/
 config_biometria.json
 client_secrets.json
 credentials.json
